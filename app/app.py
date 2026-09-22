@@ -3,7 +3,7 @@ import os
 
 app = Flask(__name__)
 
-APP_VERSION = os.getenv("APP_VERSION", "4.2.0")
+APP_VERSION = os.getenv("APP_VERSION", "4.2.1")
 APP_ENV = os.getenv("APP_ENV", "development")
 PAYMENT_MODE = os.getenv("PAYMENT_MODE", "normal")
 
@@ -35,13 +35,31 @@ def version():
 
 @app.route("/payment")
 def payment():
-    # Version 4.2.0 contains a known payment defect.
-    # This defect will be fixed in hotfix version 4.2.1.
+    # Payment defect fixed in version 4.2.1.
     return jsonify({
-        "payment_status": "FAILED",
-        "message": "Payment failed due to known payment processing defect",
+        "payment_status": "SUCCESS",
+        "message": "Payment processed successfully",
         "version": APP_VERSION
-    }), 500
+    }), 200
+
+
+@app.route("/products")
+def products():
+    return jsonify({
+        "products": [
+            {
+                "id": 1,
+                "name": "Laptop",
+                "price": 55000
+            },
+            {
+                "id": 2,
+                "name": "Smartphone",
+                "price": 25000
+            }
+        ],
+        "version": APP_VERSION
+    })
 
 
 if __name__ == "__main__":
