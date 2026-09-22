@@ -1,7 +1,6 @@
 pipeline {
 agent any
 
-```
 parameters {
     choice(
         name: 'DEPLOYMENT_ACTION',
@@ -791,6 +790,4 @@ post {
         echo "=============================================="
     }
 }
-```
-
 }
