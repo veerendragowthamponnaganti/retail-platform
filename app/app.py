@@ -63,6 +63,27 @@ def products():
     })
 
 
+@app.route("/orders")
+def orders():
+    return jsonify({
+        "orders": [
+            {
+                "order_id": 1001,
+                "product": "Laptop",
+                "quantity": 1,
+                "status": "CONFIRMED"
+            },
+            {
+                "order_id": 1002,
+                "product": "Smartphone",
+                "quantity": 2,
+                "status": "PROCESSING"
+            }
+        ],
+        "version": APP_VERSION
+    })
+
+
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
