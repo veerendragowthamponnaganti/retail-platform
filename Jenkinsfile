@@ -1,6 +1,7 @@
 pipeline {
 agent any
 
+```
 parameters {
     choice(
         name: 'DEPLOYMENT_ACTION',
@@ -106,7 +107,7 @@ stages {
                     git checkout --force tags/${params.VERSION}
                 """
 
-                def selectedCommit = bat(
+                def selectedCommit = powershell(
                     script: """
                         git rev-parse HEAD
                     """,
@@ -147,8 +148,8 @@ stages {
 
                 echo "Docker image created successfully."
 
-                bat """
-                    "${DOCKER}" images ${IMAGE_NAME}
+                powershell """
+                    & '${DOCKER}' images ${IMAGE_NAME}
                 """
             }
         }
@@ -202,9 +203,9 @@ stages {
 
                 if (productionExists == 0) {
 
-                    def previousImage = bat(
+                    def previousImage = powershell(
                         script: """
-                            "${DOCKER}" inspect --format="{{.Config.Image}}" ${PRODUCTION_CONTAINER}
+                            & '${DOCKER}' inspect --format='{{.Config.Image}}' ${PRODUCTION_CONTAINER}
                         """,
                         returnStdout: true
                     ).trim()
@@ -241,7 +242,7 @@ stages {
                 echo "MANUAL ROLLBACK REQUESTED"
                 echo "=============================================="
 
-                def rollbackImage = "${IMAGE_NAME}:v4.2.1-10"
+                def rollbackImage = "${IMAGE_NAME}:v4.2.1-22"
 
                 echo "Rollback image:"
                 echo "${rollbackImage}"
@@ -688,12 +689,12 @@ stages {
                     ? PRODUCTION_CONTAINER
                     : 'retail-app-uat'
 
-                bat """
-                    "${DOCKER}" ps
+                powershell """
+                    & '${DOCKER}' ps
                 """
 
-                bat """
-                    "${DOCKER}" inspect ${validationContainer}
+                powershell """
+                    & '${DOCKER}' inspect ${validationContainer}
                 """
 
                 echo "Deployment validation completed."
@@ -751,14 +752,14 @@ post {
 
         echo "=============================================="
 
-        bat """
-            "${DOCKER}" ps -a
+        powershell """
+            & '${DOCKER}' ps -a
         """
 
         echo "Docker images currently available:"
 
-        bat """
-            "${DOCKER}" images ${IMAGE_NAME}
+        powershell """
+            & '${DOCKER}' images ${IMAGE_NAME}
         """
     }
 
@@ -790,5 +791,6 @@ post {
         echo "=============================================="
     }
 }
+```
 
 }
