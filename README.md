@@ -2,7 +2,7 @@
 
 ## Application
 
-Retail Platform is a Flask-based application for secure enterprise retail operations.
+Retail Platform is a Flask-based application for secure enterprise DevOps and retail operations.
 Git, Docker, Jenkins deployment, hotfix, and automated rollback workflows are demonstrated using this application.
 
 ## Production Versions
@@ -17,6 +17,7 @@ Git, Docker, Jenkins deployment, hotfix, and automated rollback workflows are de
 - `develop` - Ongoing development
 - `release/4.3.0` - Release preparation
 - `hotfix/payment-4.2.1` - Emergency payment fix
+- `conflict-demo` - Intentional merge conflict demonstration
 
 ## Application Endpoints
 

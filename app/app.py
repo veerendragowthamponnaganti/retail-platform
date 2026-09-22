@@ -62,25 +62,6 @@ def products():
     })
 
 
-@app.route("/products")
-def products():
-    return jsonify({
-        "products": [
-            {
-                "id": 1,
-                "name": "Laptop",
-                "price": 55000
-            },
-            {
-                "id": 2,
-                "name": "Smartphone",
-                "price": 25000
-            }
-        ],
-        "version": APP_VERSION
-    })
-
-
 @app.route("/orders")
 def orders():
     return jsonify({
