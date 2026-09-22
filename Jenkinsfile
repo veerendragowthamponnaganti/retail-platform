@@ -1,0 +1,403 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(
+            name: 'DEPLOYMENT_ACTION',
+            choices: ['DEPLOY', 'ROLLBACK'],
+            description: 'Select deployment action'
+        )
+
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['UAT', 'PRODUCTION'],
+            description: 'Select deployment environment'
+        )
+
+        string(
+            name: 'VERSION',
+            defaultValue: 'v4.2.1',
+            description: 'Git tag to deploy, for example v4.2.1'
+        )
+
+        choice(
+            name: 'CONFIRM_PROD',
+            choices: ['NO', 'YES'],
+            description: 'Production deployment confirmation'
+        )
+    }
+
+    environment {
+        DOCKER = 'C:\\Users\\ASUS\\AppData\\Local\\Programs\\DockerDesktop\\resources\\bin\\docker.exe'
+        IMAGE_REPOSITORY = 'retail-app'
+        NETWORK_NAME = 'retail-network'
+    }
+
+    stages {
+
+        stage('Validate Parameters') {
+            steps {
+                script {
+                    echo "Deployment Action : ${params.DEPLOYMENT_ACTION}"
+                    echo "Environment       : ${params.ENVIRONMENT}"
+                    echo "Requested Version : ${params.VERSION}"
+                    echo "Production Confirm : ${params.CONFIRM_PROD}"
+
+                    if (params.ENVIRONMENT == 'PRODUCTION' &&
+                        params.CONFIRM_PROD != 'YES') {
+
+                        error(
+                            "Production deployment blocked. " +
+                            "CONFIRM_PROD must be YES."
+                        )
+                    }
+                }
+            }
+        }
+
+        stage('Checkout Requested Version') {
+            steps {
+                bat """
+                    echo Fetching Git tags...
+                    git fetch --tags --force
+
+                    echo Validating requested tag...
+                    git rev-parse --verify refs/tags/%VERSION%
+
+                    echo Checking out requested version...
+                    git checkout --force tags/%VERSION%
+
+                    echo Selected Git commit:
+                    git rev-parse HEAD
+
+                    echo Selected Git commit details:
+                    git log -1 --oneline
+                """
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    bat """
+                        "%DOCKER%" network inspect %NETWORK_NAME% >nul 2>&1 || "%DOCKER%" network create %NETWORK_NAME%
+
+                        echo Building Docker image...
+
+                        "%DOCKER%" build ^
+                          -t %IMAGE_REPOSITORY%:%VERSION%-%BUILD_NUMBER% ^
+                          .
+
+                        echo Docker image created:
+                        "%DOCKER%" images %IMAGE_REPOSITORY%
+                    """
+                }
+            }
+        }
+
+        stage('Record Previous Production') {
+            when {
+                expression {
+                    params.ENVIRONMENT == 'PRODUCTION'
+                }
+            }
+
+            steps {
+                script {
+                    def previousImage = bat(
+                        returnStdout: true,
+                        script: """
+                            @echo off
+                            "%DOCKER%" inspect --format="{{.Config.Image}}" retail-app-production 2>nul || echo NONE
+                        """
+                    ).trim()
+
+                    env.PREVIOUS_PRODUCTION_IMAGE = previousImage
+
+                    echo "Previous production image: ${env.PREVIOUS_PRODUCTION_IMAGE}"
+                }
+            }
+        }
+
+        stage('Deploy and Health Check') {
+            steps {
+                script {
+
+                    def hostPort =
+                        params.ENVIRONMENT == 'PRODUCTION'
+                        ? '8081'
+                        : '8082'
+
+                    def candidateName =
+                        "retail-app-candidate-${env.BUILD_NUMBER}"
+
+                    def productionName =
+                        params.ENVIRONMENT == 'PRODUCTION'
+                        ? 'retail-app-production'
+                        : 'retail-app-uat'
+
+                    def image =
+                        "${env.IMAGE_REPOSITORY}:${params.VERSION}-${env.BUILD_NUMBER}"
+
+                    def previousImage =
+                        env.PREVIOUS_PRODUCTION_IMAGE ?: 'NONE'
+
+                    try {
+
+                        echo "========================================"
+                        echo "Starting deployment"
+                        echo "New image      : ${image}"
+                        echo "Environment    : ${params.ENVIRONMENT}"
+                        echo "Candidate      : ${candidateName}"
+                        echo "========================================"
+
+                        bat """
+                            "%DOCKER%" rm -f ${candidateName} >nul 2>&1 || exit /b 0
+
+                            "%DOCKER%" run -d ^
+                              --name ${candidateName} ^
+                              --network %NETWORK_NAME% ^
+                              -p ${hostPort}:8081 ^
+                              --cpus 1 ^
+                              --memory 512m ^
+                              -e APP_VERSION=%VERSION% ^
+                              -e APP_ENV=%ENVIRONMENT% ^
+                              ${image}
+                        """
+
+                        echo "Candidate container started."
+                        echo "Waiting for Docker health check..."
+
+                        powershell """
+                            \\$container = '${candidateName}'
+                            \\$docker = '\\$env:DOCKER'
+
+                            for (\\$i = 1; \\$i -le 12; \\$i++) {
+
+                                \\$status = & \\$docker inspect --format='{{.State.Health.Status}}' \\$container 2>\\$null
+
+                                Write-Host "Health check attempt \\$i : \\$status"
+
+                                if (\\$status -eq 'healthy') {
+                                    Write-Host 'Candidate is healthy.'
+                                    exit 0
+                                }
+
+                                if (\\$status -eq 'unhealthy') {
+                                    Write-Host 'Candidate is unhealthy.'
+                                    exit 1
+                                }
+
+                                Start-Sleep -Seconds 5
+                            }
+
+                            Write-Host 'Health check timed out.'
+                            exit 1
+                        """
+
+                        echo "Candidate health check passed."
+
+                        if (params.ENVIRONMENT == 'PRODUCTION') {
+
+                            echo "Previous production image: ${previousImage}"
+
+                            echo "Removing old production container only after new version is healthy."
+
+                            bat """
+                                "%DOCKER%" rm -f ${productionName} >nul 2>&1 || exit /b 0
+                            """
+
+                            bat """
+                                "%DOCKER%" rm -f retail-app-candidate-${env.BUILD_NUMBER} >nul 2>&1 || exit /b 0
+
+                                "%DOCKER%" run -d ^
+                                  --name ${productionName} ^
+                                  --network %NETWORK_NAME% ^
+                                  -p 8081:8081 ^
+                                  --cpus 1 ^
+                                  --memory 512m ^
+                                  -e APP_VERSION=%VERSION% ^
+                                  -e APP_ENV=production ^
+                                  ${image}
+                            """
+
+                        } else {
+
+                            bat """
+                                "%DOCKER%" rm -f ${productionName} >nul 2>&1 || exit /b 0
+
+                                "%DOCKER%" run -d ^
+                                  --name ${productionName} ^
+                                  --network %NETWORK_NAME% ^
+                                  -p 8082:8081 ^
+                                  --cpus 1 ^
+                                  --memory 512m ^
+                                  -e APP_VERSION=%VERSION% ^
+                                  -e APP_ENV=uat ^
+                                  ${image}
+                            """
+                        }
+
+                        echo "Final container started."
+
+                        powershell """
+                            \\$container = '${productionName}'
+                            \\$docker = '\\$env:DOCKER'
+
+                            for (\\$i = 1; \\$i -le 12; \\$i++) {
+
+                                \\$status = & \\$docker inspect --format='{{.State.Health.Status}}' \\$container 2>\\$null
+
+                                Write-Host "Final health check attempt \\$i : \\$status"
+
+                                if (\\$status -eq 'healthy') {
+                                    Write-Host 'Final container is healthy.'
+                                    exit 0
+                                }
+
+                                if (\\$status -eq 'unhealthy') {
+                                    Write-Host 'Final container is unhealthy.'
+                                    exit 1
+                                }
+
+                                Start-Sleep -Seconds 5
+                            }
+
+                            Write-Host 'Final health check timed out.'
+                            exit 1
+                        """
+
+                        echo "========================================"
+                        echo "DEPLOYMENT SUCCESSFUL"
+                        echo "Version : ${params.VERSION}"
+                        echo "Image   : ${image}"
+                        echo "========================================"
+
+                    } catch (Exception deploymentError) {
+
+                        echo "========================================"
+                        echo "DEPLOYMENT FAILED"
+                        echo "Starting automatic rollback..."
+                        echo "========================================"
+
+                        bat """
+                            "%DOCKER%" rm -f ${candidateName} >nul 2>&1 || exit /b 0
+                        """
+
+                        if (params.ENVIRONMENT == 'PRODUCTION' &&
+                            previousImage != 'NONE' &&
+                            previousImage != '') {
+
+                            echo "Restoring previous production image:"
+                            echo "${previousImage}"
+
+                            bat """
+                                "%DOCKER%" rm -f retail-app-production >nul 2>&1 || exit /b 0
+
+                                "%DOCKER%" run -d ^
+                                  --name retail-app-production ^
+                                  --network %NETWORK_NAME% ^
+                                  -p 8081:8081 ^
+                                  --cpus 1 ^
+                                  --memory 512m ^
+                                  -e APP_VERSION=4.2.1 ^
+                                  -e APP_ENV=production ^
+                                  ${previousImage}
+                            """
+
+                            powershell """
+                                \\$container = 'retail-app-production'
+                                \\$docker = '\\$env:DOCKER'
+
+                                for (\\$i = 1; \\$i -le 12; \\$i++) {
+
+                                    \\$status = & \\$docker inspect --format='{{.State.Health.Status}}' \\$container 2>\\$null
+
+                                    Write-Host "Rollback health check attempt \\$i : \\$status"
+
+                                    if (\\$status -eq 'healthy') {
+                                        Write-Host 'Rollback successful.'
+                                        exit 0
+                                    }
+
+                                    if (\\$status -eq 'unhealthy') {
+                                        Write-Host 'Rollback container is unhealthy.'
+                                        exit 1
+                                    }
+
+                                    Start-Sleep -Seconds 5
+                                }
+
+                                Write-Host 'Rollback health check timed out.'
+                                exit 1
+                            """
+
+                            echo "Rollback verified successfully."
+
+                        } else {
+
+                            echo "No previous production image was available for rollback."
+                        }
+
+                        error(
+                            "Deployment failed. " +
+                            "Automatic rollback process completed or previous image was unavailable."
+                        )
+                    }
+                }
+            }
+        }
+
+        stage('Deployment Validation') {
+            steps {
+                script {
+
+                    def validationPort =
+                        params.ENVIRONMENT == 'PRODUCTION'
+                        ? '8081'
+                        : '8082'
+
+                    bat """
+                        echo Running final API validation...
+
+                        curl --fail http://localhost:${validationPort}/health
+
+                        echo.
+                        echo Version endpoint:
+
+                        curl --fail http://localhost:${validationPort}/version
+
+                        echo.
+                        echo Running container status:
+
+                        "%DOCKER%" ps
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+
+        success {
+            echo "========================================"
+            echo "FINAL STATE: DEPLOYMENT SUCCESSFUL"
+            echo "VERSION: ${params.VERSION}"
+            echo "ENVIRONMENT: ${params.ENVIRONMENT}"
+            echo "========================================"
+        }
+
+        failure {
+            echo "========================================"
+            echo "FINAL STATE: DEPLOYMENT FAILED / ROLLBACK"
+            echo "VERSION: ${params.VERSION}"
+            echo "ENVIRONMENT: ${params.ENVIRONMENT}"
+            echo "========================================"
+        }
+
+        always {
+            echo "Jenkins build number: ${env.BUILD_NUMBER}"
+            echo "Jenkins result: ${currentBuild.currentResult}"
+        }
+    }
+}

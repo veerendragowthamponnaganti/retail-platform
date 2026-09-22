@@ -1,0 +1,42 @@
+services:
+  retail-app:
+    build:
+      context: .
+    image: retail-app:${APP_VERSION:-4.2.1}
+    container_name: retail-app
+    ports:
+      - "8081:8081"
+
+    environment:
+      APP_VERSION: ${APP_VERSION:-4.2.1}
+      APP_ENV: ${APP_ENV:-uat}
+      PAYMENT_MODE: ${PAYMENT_MODE:-normal}
+
+    networks:
+      - retail-network
+
+    volumes:
+      - retail-data:/app/data
+
+    cpus: "1.0"
+    mem_limit: 512m
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health').read()"
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+networks:
+  retail-network:
+    driver: bridge
+
+volumes:
+  retail-data:
