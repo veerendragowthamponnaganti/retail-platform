@@ -1,7 +1,6 @@
 pipeline {
 agent any
 
-```
 parameters {
     choice(
         name: 'DEPLOYMENT_ACTION',
@@ -42,7 +41,7 @@ stages {
             echo "Deployment Action : ${params.DEPLOYMENT_ACTION}"
             echo "Environment       : ${params.ENVIRONMENT}"
             echo "Requested Version : ${params.VERSION}"
-            echo "Production Confirm : ${params.CONFIRM_PROD}"
+            echo "Production Confirm: ${params.CONFIRM_PROD}"
             echo "Build Number      : ${env.BUILD_NUMBER}"
             echo "=============================================="
         }
@@ -558,6 +557,4 @@ post {
         echo "=============================================="
     }
 }
-```
-
 }
