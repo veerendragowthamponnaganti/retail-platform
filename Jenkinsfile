@@ -133,7 +133,7 @@ pipeline {
 
                         echo Building Docker image:
 
-                        ${env.IMAGE_REPOSITORY}:${imageTag}
+                        echo ${env.IMAGE_REPOSITORY}:${imageTag}
 
                         "%DOCKER%" build ^
                             -t ${env.IMAGE_REPOSITORY}:${imageTag} ^
@@ -294,6 +294,11 @@ pipeline {
                         echo "Candidate      : ${candidateName}"
                         echo "========================================"
 
+                        /*
+                         * Start candidate container.
+                         * UAT uses port 8082.
+                         * Production uses port 8081.
+                         */
                         bat """
                             "%DOCKER%" rm -f ${candidateName} >nul 2>&1 || exit /b 0
 
@@ -345,6 +350,9 @@ pipeline {
 
                         echo "Candidate health check passed."
 
+                        /*
+                         * PRODUCTION DEPLOYMENT
+                         */
                         if (environment == 'PRODUCTION') {
 
                             echo "Previous production image: ${previousImage}"
@@ -355,8 +363,13 @@ pipeline {
                                 "%DOCKER%" rm -f ${productionName} >nul 2>&1 || exit /b 0
                             """
 
+                            /*
+                             * Candidate is healthy.
+                             * Remove candidate before starting production
+                             * because production will use port 8081.
+                             */
                             bat """
-                                "%DOCKER%" rm -f ${candidateName} >nul 2>&1 || exit /b 0
+                                "%DOCKER%" rm -f ${candidateName} >nul 2>&1
 
                                 "%DOCKER%" run -d ^
                                     --name ${productionName} ^
@@ -374,11 +387,33 @@ pipeline {
                                 )
                             """
 
+                        /*
+                         * UAT DEPLOYMENT
+                         */
                         } else {
 
+                            echo "Candidate is healthy. Promoting candidate to UAT."
+
+                            /*
+                             * Remove any previous UAT container.
+                             */
                             bat """
                                 "%DOCKER%" rm -f ${productionName} >nul 2>&1 || exit /b 0
+                            """
 
+                            /*
+                             * IMPORTANT:
+                             * Candidate is currently using port 8082.
+                             * Remove candidate before starting final UAT container.
+                             */
+                            bat """
+                                "%DOCKER%" rm -f ${candidateName} >nul 2>&1
+                            """
+
+                            /*
+                             * Start final UAT container on port 8082.
+                             */
+                            bat """
                                 "%DOCKER%" run -d ^
                                     --name ${productionName} ^
                                     --network %NETWORK_NAME% ^
@@ -398,6 +433,9 @@ pipeline {
 
                         echo "Final container started."
 
+                        /*
+                         * Final health check
+                         */
                         powershell """
                             \$container = '${productionName}'
                             \$docker = \$env:DOCKER
@@ -438,10 +476,17 @@ pipeline {
                         echo "STARTING AUTOMATIC ROLLBACK"
                         echo "========================================"
 
+                        /*
+                         * Remove failed candidate container.
+                         */
                         bat """
                             "%DOCKER%" rm -f ${candidateName} >nul 2>&1 || exit /b 0
                         """
 
+                        /*
+                         * Automatic rollback is required only for
+                         * production when a previous image exists.
+                         */
                         if (environment == 'PRODUCTION' &&
                             previousImage != 'NONE' &&
                             previousImage != '') {
