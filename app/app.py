@@ -44,6 +44,25 @@ def payment():
     }), 500
 
 
+@app.route("/products")
+def products():
+    return jsonify({
+        "products": [
+            {
+                "id": 1,
+                "name": "Laptop",
+                "price": 55000
+            },
+            {
+                "id": 2,
+                "name": "Smartphone",
+                "price": 25000
+            }
+        ],
+        "version": APP_VERSION
+    })
+
+
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
