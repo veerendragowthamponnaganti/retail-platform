@@ -38,10 +38,12 @@ pipeline {
         stage('Validate Parameters') {
             steps {
                 script {
+                    echo "========================================"
                     echo "Deployment Action : ${params.DEPLOYMENT_ACTION}"
                     echo "Environment       : ${params.ENVIRONMENT}"
                     echo "Requested Version : ${params.VERSION}"
                     echo "Production Confirm : ${params.CONFIRM_PROD}"
+                    echo "========================================"
 
                     if (params.ENVIRONMENT == 'PRODUCTION' &&
                         params.CONFIRM_PROD != 'YES') {
@@ -57,7 +59,7 @@ pipeline {
 
         stage('Checkout Requested Version') {
             steps {
-                bat """
+                bat '''
                     echo Fetching Git tags...
                     git fetch --tags --force
 
@@ -67,31 +69,50 @@ pipeline {
                     echo Checking out requested version...
                     git checkout --force tags/%VERSION%
 
+                    echo.
                     echo Selected Git commit:
                     git rev-parse HEAD
 
+                    echo.
                     echo Selected Git commit details:
                     git log -1 --oneline
-                """
+                '''
             }
         }
 
         stage('Build Docker Image') {
-            steps {
-                script {
-                    bat """
-                        "%DOCKER%" network inspect %NETWORK_NAME% >nul 2>&1 || "%DOCKER%" network create %NETWORK_NAME%
-
-                        echo Building Docker image...
-
-                        "%DOCKER%" build ^
-                          -t %IMAGE_REPOSITORY%:%VERSION%-%BUILD_NUMBER% ^
-                          .
-
-                        echo Docker image created:
-                        "%DOCKER%" images %IMAGE_REPOSITORY%
-                    """
+            when {
+                expression {
+                    params.DEPLOYMENT_ACTION == 'DEPLOY'
                 }
+            }
+
+            steps {
+                bat '''
+                    echo Checking Docker...
+
+                    "%DOCKER%" --version
+
+                    echo.
+
+                    echo Creating Docker network if required...
+
+                    "%DOCKER%" network inspect %NETWORK_NAME% >nul 2>&1 || "%DOCKER%" network create %NETWORK_NAME%
+
+                    echo.
+
+                    echo Building Docker image...
+
+                    "%DOCKER%" build ^
+                        -t %IMAGE_REPOSITORY%:%VERSION%-%BUILD_NUMBER% ^
+                        .
+
+                    echo.
+
+                    echo Docker image created:
+
+                    "%DOCKER%" images %IMAGE_REPOSITORY%
+                '''
             }
         }
 
@@ -104,12 +125,14 @@ pipeline {
 
             steps {
                 script {
+
                     def previousImage = bat(
                         returnStdout: true,
-                        script: """
+                        script: '''
                             @echo off
+
                             "%DOCKER%" inspect --format="{{.Config.Image}}" retail-app-production 2>nul || echo NONE
-                        """
+                        '''
                     ).trim()
 
                     env.PREVIOUS_PRODUCTION_IMAGE = previousImage
@@ -119,7 +142,87 @@ pipeline {
             }
         }
 
+        stage('Rollback Action') {
+            when {
+                expression {
+                    params.DEPLOYMENT_ACTION == 'ROLLBACK'
+                }
+            }
+
+            steps {
+                script {
+
+                    if (params.ENVIRONMENT != 'PRODUCTION') {
+                        error("ROLLBACK is supported only for PRODUCTION.")
+                    }
+
+                    def previousImage =
+                        env.PREVIOUS_PRODUCTION_IMAGE ?: 'retail-app:4.2.1'
+
+                    echo "========================================"
+                    echo "MANUAL ROLLBACK REQUESTED"
+                    echo "Restoring image: ${previousImage}"
+                    echo "========================================"
+
+                    bat """
+                        "%DOCKER%" network inspect %NETWORK_NAME% >nul 2>&1 || "%DOCKER%" network create %NETWORK_NAME%
+
+                        "%DOCKER%" rm -f retail-app-production >nul 2>&1 || exit /b 0
+
+                        "%DOCKER%" run -d ^
+                            --name retail-app-production ^
+                            --network %NETWORK_NAME% ^
+                            -p 8081:8081 ^
+                            --cpus 1 ^
+                            --memory 512m ^
+                            -e APP_VERSION=4.2.1 ^
+                            -e APP_ENV=production ^
+                            ${previousImage}
+                    """
+
+                    echo "Rollback container started."
+
+                    powershell '''
+                        $container = "retail-app-production"
+                        $docker = $env:DOCKER
+
+                        for ($i = 1; $i -le 12; $i++) {
+
+                            $status = & $docker inspect --format="{{.State.Health.Status}}" $container 2>$null
+
+                            Write-Host "Rollback health check attempt $i : $status"
+
+                            if ($status -eq "healthy") {
+                                Write-Host "Rollback successful."
+                                exit 0
+                            }
+
+                            if ($status -eq "unhealthy") {
+                                Write-Host "Rollback container is unhealthy."
+                                exit 1
+                            }
+
+                            Start-Sleep -Seconds 5
+                        }
+
+                        Write-Host "Rollback health check timed out."
+                        exit 1
+                    '''
+
+                    echo "========================================"
+                    echo "ROLLBACK VERIFIED SUCCESSFULLY"
+                    echo "========================================"
+                }
+            }
+        }
+
         stage('Deploy and Health Check') {
+            when {
+                expression {
+                    params.DEPLOYMENT_ACTION == 'DEPLOY'
+                }
+            }
+
             steps {
                 script {
 
@@ -145,7 +248,7 @@ pipeline {
                     try {
 
                         echo "========================================"
-                        echo "Starting deployment"
+                        echo "STARTING DEPLOYMENT"
                         echo "New image      : ${image}"
                         echo "Environment    : ${params.ENVIRONMENT}"
                         echo "Candidate      : ${candidateName}"
@@ -155,45 +258,45 @@ pipeline {
                             "%DOCKER%" rm -f ${candidateName} >nul 2>&1 || exit /b 0
 
                             "%DOCKER%" run -d ^
-                              --name ${candidateName} ^
-                              --network %NETWORK_NAME% ^
-                              -p ${hostPort}:8081 ^
-                              --cpus 1 ^
-                              --memory 512m ^
-                              -e APP_VERSION=%VERSION% ^
-                              -e APP_ENV=%ENVIRONMENT% ^
-                              ${image}
+                                --name ${candidateName} ^
+                                --network %NETWORK_NAME% ^
+                                -p ${hostPort}:8081 ^
+                                --cpus 1 ^
+                                --memory 512m ^
+                                -e APP_VERSION=%VERSION% ^
+                                -e APP_ENV=%ENVIRONMENT% ^
+                                ${image}
                         """
 
                         echo "Candidate container started."
                         echo "Waiting for Docker health check..."
 
-                        powershell """
-                            \\$container = '${candidateName}'
-                            \\$docker = '\\$env:DOCKER'
+                        powershell '''
+                            $container = "''' + candidateName + '''"
+                            $docker = $env:DOCKER
 
-                            for (\\$i = 1; \\$i -le 12; \\$i++) {
+                            for ($i = 1; $i -le 12; $i++) {
 
-                                \\$status = & \\$docker inspect --format='{{.State.Health.Status}}' \\$container 2>\\$null
+                                $status = & $docker inspect --format="{{.State.Health.Status}}" $container 2>$null
 
-                                Write-Host "Health check attempt \\$i : \\$status"
+                                Write-Host "Health check attempt $i : $status"
 
-                                if (\\$status -eq 'healthy') {
-                                    Write-Host 'Candidate is healthy.'
+                                if ($status -eq "healthy") {
+                                    Write-Host "Candidate is healthy."
                                     exit 0
                                 }
 
-                                if (\\$status -eq 'unhealthy') {
-                                    Write-Host 'Candidate is unhealthy.'
+                                if ($status -eq "unhealthy") {
+                                    Write-Host "Candidate is unhealthy."
                                     exit 1
                                 }
 
                                 Start-Sleep -Seconds 5
                             }
 
-                            Write-Host 'Health check timed out.'
+                            Write-Host "Health check timed out."
                             exit 1
-                        """
+                        '''
 
                         echo "Candidate health check passed."
 
@@ -208,17 +311,17 @@ pipeline {
                             """
 
                             bat """
-                                "%DOCKER%" rm -f retail-app-candidate-${env.BUILD_NUMBER} >nul 2>&1 || exit /b 0
+                                "%DOCKER%" rm -f ${candidateName} >nul 2>&1 || exit /b 0
 
                                 "%DOCKER%" run -d ^
-                                  --name ${productionName} ^
-                                  --network %NETWORK_NAME% ^
-                                  -p 8081:8081 ^
-                                  --cpus 1 ^
-                                  --memory 512m ^
-                                  -e APP_VERSION=%VERSION% ^
-                                  -e APP_ENV=production ^
-                                  ${image}
+                                    --name ${productionName} ^
+                                    --network %NETWORK_NAME% ^
+                                    -p 8081:8081 ^
+                                    --cpus 1 ^
+                                    --memory 512m ^
+                                    -e APP_VERSION=%VERSION% ^
+                                    -e APP_ENV=production ^
+                                    ${image}
                             """
 
                         } else {
@@ -227,45 +330,45 @@ pipeline {
                                 "%DOCKER%" rm -f ${productionName} >nul 2>&1 || exit /b 0
 
                                 "%DOCKER%" run -d ^
-                                  --name ${productionName} ^
-                                  --network %NETWORK_NAME% ^
-                                  -p 8082:8081 ^
-                                  --cpus 1 ^
-                                  --memory 512m ^
-                                  -e APP_VERSION=%VERSION% ^
-                                  -e APP_ENV=uat ^
-                                  ${image}
+                                    --name ${productionName} ^
+                                    --network %NETWORK_NAME% ^
+                                    -p 8082:8081 ^
+                                    --cpus 1 ^
+                                    --memory 512m ^
+                                    -e APP_VERSION=%VERSION% ^
+                                    -e APP_ENV=uat ^
+                                    ${image}
                             """
                         }
 
                         echo "Final container started."
 
-                        powershell """
-                            \\$container = '${productionName}'
-                            \\$docker = '\\$env:DOCKER'
+                        powershell '''
+                            $container = "''' + productionName + '''"
+                            $docker = $env:DOCKER
 
-                            for (\\$i = 1; \\$i -le 12; \\$i++) {
+                            for ($i = 1; $i -le 12; $i++) {
 
-                                \\$status = & \\$docker inspect --format='{{.State.Health.Status}}' \\$container 2>\\$null
+                                $status = & $docker inspect --format="{{.State.Health.Status}}" $container 2>$null
 
-                                Write-Host "Final health check attempt \\$i : \\$status"
+                                Write-Host "Final health check attempt $i : $status"
 
-                                if (\\$status -eq 'healthy') {
-                                    Write-Host 'Final container is healthy.'
+                                if ($status -eq "healthy") {
+                                    Write-Host "Final container is healthy."
                                     exit 0
                                 }
 
-                                if (\\$status -eq 'unhealthy') {
-                                    Write-Host 'Final container is unhealthy.'
+                                if ($status -eq "unhealthy") {
+                                    Write-Host "Final container is unhealthy."
                                     exit 1
                                 }
 
                                 Start-Sleep -Seconds 5
                             }
 
-                            Write-Host 'Final health check timed out.'
+                            Write-Host "Final health check timed out."
                             exit 1
-                        """
+                        '''
 
                         echo "========================================"
                         echo "DEPLOYMENT SUCCESSFUL"
@@ -277,7 +380,7 @@ pipeline {
 
                         echo "========================================"
                         echo "DEPLOYMENT FAILED"
-                        echo "Starting automatic rollback..."
+                        echo "STARTING AUTOMATIC ROLLBACK"
                         echo "========================================"
 
                         bat """
@@ -295,42 +398,42 @@ pipeline {
                                 "%DOCKER%" rm -f retail-app-production >nul 2>&1 || exit /b 0
 
                                 "%DOCKER%" run -d ^
-                                  --name retail-app-production ^
-                                  --network %NETWORK_NAME% ^
-                                  -p 8081:8081 ^
-                                  --cpus 1 ^
-                                  --memory 512m ^
-                                  -e APP_VERSION=4.2.1 ^
-                                  -e APP_ENV=production ^
-                                  ${previousImage}
+                                    --name retail-app-production ^
+                                    --network %NETWORK_NAME% ^
+                                    -p 8081:8081 ^
+                                    --cpus 1 ^
+                                    --memory 512m ^
+                                    -e APP_VERSION=4.2.1 ^
+                                    -e APP_ENV=production ^
+                                    ${previousImage}
                             """
 
-                            powershell """
-                                \\$container = 'retail-app-production'
-                                \\$docker = '\\$env:DOCKER'
+                            powershell '''
+                                $container = "retail-app-production"
+                                $docker = $env:DOCKER
 
-                                for (\\$i = 1; \\$i -le 12; \\$i++) {
+                                for ($i = 1; $i -le 12; $i++) {
 
-                                    \\$status = & \\$docker inspect --format='{{.State.Health.Status}}' \\$container 2>\\$null
+                                    $status = & $docker inspect --format="{{.State.Health.Status}}" $container 2>$null
 
-                                    Write-Host "Rollback health check attempt \\$i : \\$status"
+                                    Write-Host "Rollback health check attempt $i : $status"
 
-                                    if (\\$status -eq 'healthy') {
-                                        Write-Host 'Rollback successful.'
+                                    if ($status -eq "healthy") {
+                                        Write-Host "Rollback successful."
                                         exit 0
                                     }
 
-                                    if (\\$status -eq 'unhealthy') {
-                                        Write-Host 'Rollback container is unhealthy.'
+                                    if ($status -eq "unhealthy") {
+                                        Write-Host "Rollback container is unhealthy."
                                         exit 1
                                     }
 
                                     Start-Sleep -Seconds 5
                                 }
 
-                                Write-Host 'Rollback health check timed out.'
+                                Write-Host "Rollback health check timed out."
                                 exit 1
-                            """
+                            '''
 
                             echo "Rollback verified successfully."
 
@@ -340,8 +443,7 @@ pipeline {
                         }
 
                         error(
-                            "Deployment failed. " +
-                            "Automatic rollback process completed or previous image was unavailable."
+                            "Deployment failed. Automatic rollback process completed."
                         )
                     }
                 }
@@ -349,6 +451,12 @@ pipeline {
         }
 
         stage('Deployment Validation') {
+            when {
+                expression {
+                    params.DEPLOYMENT_ACTION == 'DEPLOY'
+                }
+            }
+
             steps {
                 script {
 
@@ -363,11 +471,13 @@ pipeline {
                         curl --fail http://localhost:${validationPort}/health
 
                         echo.
+
                         echo Version endpoint:
 
                         curl --fail http://localhost:${validationPort}/version
 
                         echo.
+
                         echo Running container status:
 
                         "%DOCKER%" ps
@@ -396,8 +506,10 @@ pipeline {
         }
 
         always {
+            echo "========================================"
             echo "Jenkins build number: ${env.BUILD_NUMBER}"
             echo "Jenkins result: ${currentBuild.currentResult}"
+            echo "========================================"
         }
     }
 }
