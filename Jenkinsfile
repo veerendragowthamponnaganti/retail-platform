@@ -45,6 +45,10 @@ pipeline {
                     echo "Production Confirm : ${params.CONFIRM_PROD}"
                     echo "========================================"
 
+                    if (!params.VERSION?.trim()) {
+                        error("VERSION cannot be empty.")
+                    }
+
                     if (params.ENVIRONMENT == 'PRODUCTION' &&
                         params.CONFIRM_PROD != 'YES') {
 
@@ -59,24 +63,45 @@ pipeline {
 
         stage('Checkout Requested Version') {
             steps {
-                bat '''
-                    echo Fetching Git tags...
-                    git fetch --tags --force
+                script {
 
-                    echo Validating requested tag...
-                    git rev-parse --verify refs/tags/%VERSION%
+                    def version = params.VERSION
 
-                    echo Checking out requested version...
-                    git checkout --force tags/%VERSION%
+                    bat """
+                        echo Fetching Git tags...
 
-                    echo.
-                    echo Selected Git commit:
-                    git rev-parse HEAD
+                        git fetch --tags --force
 
-                    echo.
-                    echo Selected Git commit details:
-                    git log -1 --oneline
-                '''
+                        echo.
+
+                        echo Validating requested tag:
+
+                        git rev-parse --verify refs/tags/${version}
+
+                        if errorlevel 1 (
+                            echo Requested Git tag ${version} does not exist.
+                            exit /b 1
+                        )
+
+                        echo.
+
+                        echo Checking out requested version:
+
+                        git checkout --force tags/${version}
+
+                        echo.
+
+                        echo Selected Git commit:
+
+                        git rev-parse HEAD
+
+                        echo.
+
+                        echo Selected Git commit details:
+
+                        git log -1 --oneline
+                    """
+                }
             }
         }
 
@@ -88,31 +113,44 @@ pipeline {
             }
 
             steps {
-                bat '''
-                    echo Checking Docker...
+                script {
 
-                    "%DOCKER%" --version
+                    def version = params.VERSION
+                    def imageTag = "${version}-${env.BUILD_NUMBER}"
 
-                    echo.
+                    bat """
+                        echo Checking Docker...
 
-                    echo Creating Docker network if required...
+                        "%DOCKER%" --version
 
-                    "%DOCKER%" network inspect %NETWORK_NAME% >nul 2>&1 || "%DOCKER%" network create %NETWORK_NAME%
+                        echo.
 
-                    echo.
+                        echo Creating Docker network if required...
 
-                    echo Building Docker image...
+                        "%DOCKER%" network inspect %NETWORK_NAME% >nul 2>&1 || "%DOCKER%" network create %NETWORK_NAME%
 
-                    "%DOCKER%" build ^
-                        -t %IMAGE_REPOSITORY%:%VERSION%-%BUILD_NUMBER% ^
-                        .
+                        echo.
 
-                    echo.
+                        echo Building Docker image:
 
-                    echo Docker image created:
+                        ${env.IMAGE_REPOSITORY}:${imageTag}
 
-                    "%DOCKER%" images %IMAGE_REPOSITORY%
-                '''
+                        "%DOCKER%" build ^
+                            -t ${env.IMAGE_REPOSITORY}:${imageTag} ^
+                            .
+
+                        if errorlevel 1 (
+                            echo Docker image build failed.
+                            exit /b 1
+                        )
+
+                        echo.
+
+                        echo Docker image created:
+
+                        "%DOCKER%" images %IMAGE_REPOSITORY%
+                    """
+                }
             }
         }
 
@@ -130,7 +168,6 @@ pipeline {
                         returnStdout: true,
                         script: '''
                             @echo off
-
                             "%DOCKER%" inspect --format="{{.Config.Image}}" retail-app-production 2>nul || echo NONE
                         '''
                     ).trim()
@@ -226,8 +263,11 @@ pipeline {
             steps {
                 script {
 
+                    def version = params.VERSION
+                    def environment = params.ENVIRONMENT
+
                     def hostPort =
-                        params.ENVIRONMENT == 'PRODUCTION'
+                        environment == 'PRODUCTION'
                         ? '8081'
                         : '8082'
 
@@ -235,12 +275,12 @@ pipeline {
                         "retail-app-candidate-${env.BUILD_NUMBER}"
 
                     def productionName =
-                        params.ENVIRONMENT == 'PRODUCTION'
+                        environment == 'PRODUCTION'
                         ? 'retail-app-production'
                         : 'retail-app-uat'
 
                     def image =
-                        "${env.IMAGE_REPOSITORY}:${params.VERSION}-${env.BUILD_NUMBER}"
+                        "${env.IMAGE_REPOSITORY}:${version}-${env.BUILD_NUMBER}"
 
                     def previousImage =
                         env.PREVIOUS_PRODUCTION_IMAGE ?: 'NONE'
@@ -250,7 +290,7 @@ pipeline {
                         echo "========================================"
                         echo "STARTING DEPLOYMENT"
                         echo "New image      : ${image}"
-                        echo "Environment    : ${params.ENVIRONMENT}"
+                        echo "Environment    : ${environment}"
                         echo "Candidate      : ${candidateName}"
                         echo "========================================"
 
@@ -263,44 +303,49 @@ pipeline {
                                 -p ${hostPort}:8081 ^
                                 --cpus 1 ^
                                 --memory 512m ^
-                                -e APP_VERSION=%VERSION% ^
-                                -e APP_ENV=%ENVIRONMENT% ^
+                                -e APP_VERSION=${version} ^
+                                -e APP_ENV=${environment} ^
                                 ${image}
+
+                            if errorlevel 1 (
+                                echo Failed to start candidate container.
+                                exit /b 1
+                            )
                         """
 
                         echo "Candidate container started."
                         echo "Waiting for Docker health check..."
 
-                        powershell '''
-                            $container = "''' + candidateName + '''"
-                            $docker = $env:DOCKER
+                        powershell """
+                            \$container = '${candidateName}'
+                            \$docker = \$env:DOCKER
 
-                            for ($i = 1; $i -le 12; $i++) {
+                            for (\$i = 1; \$i -le 12; \$i++) {
 
-                                $status = & $docker inspect --format="{{.State.Health.Status}}" $container 2>$null
+                                \$status = & \$docker inspect --format='{{.State.Health.Status}}' \$container 2>\$null
 
-                                Write-Host "Health check attempt $i : $status"
+                                Write-Host "Health check attempt \$i : \$status"
 
-                                if ($status -eq "healthy") {
-                                    Write-Host "Candidate is healthy."
+                                if (\$status -eq 'healthy') {
+                                    Write-Host 'Candidate is healthy.'
                                     exit 0
                                 }
 
-                                if ($status -eq "unhealthy") {
-                                    Write-Host "Candidate is unhealthy."
+                                if (\$status -eq 'unhealthy') {
+                                    Write-Host 'Candidate is unhealthy.'
                                     exit 1
                                 }
 
                                 Start-Sleep -Seconds 5
                             }
 
-                            Write-Host "Health check timed out."
+                            Write-Host 'Health check timed out.'
                             exit 1
-                        '''
+                        """
 
                         echo "Candidate health check passed."
 
-                        if (params.ENVIRONMENT == 'PRODUCTION') {
+                        if (environment == 'PRODUCTION') {
 
                             echo "Previous production image: ${previousImage}"
 
@@ -319,9 +364,14 @@ pipeline {
                                     -p 8081:8081 ^
                                     --cpus 1 ^
                                     --memory 512m ^
-                                    -e APP_VERSION=%VERSION% ^
+                                    -e APP_VERSION=${version} ^
                                     -e APP_ENV=production ^
                                     ${image}
+
+                                if errorlevel 1 (
+                                    echo Failed to start production container.
+                                    exit /b 1
+                                )
                             """
 
                         } else {
@@ -335,44 +385,49 @@ pipeline {
                                     -p 8082:8081 ^
                                     --cpus 1 ^
                                     --memory 512m ^
-                                    -e APP_VERSION=%VERSION% ^
+                                    -e APP_VERSION=${version} ^
                                     -e APP_ENV=uat ^
                                     ${image}
+
+                                if errorlevel 1 (
+                                    echo Failed to start UAT container.
+                                    exit /b 1
+                                )
                             """
                         }
 
                         echo "Final container started."
 
-                        powershell '''
-                            $container = "''' + productionName + '''"
-                            $docker = $env:DOCKER
+                        powershell """
+                            \$container = '${productionName}'
+                            \$docker = \$env:DOCKER
 
-                            for ($i = 1; $i -le 12; $i++) {
+                            for (\$i = 1; \$i -le 12; \$i++) {
 
-                                $status = & $docker inspect --format="{{.State.Health.Status}}" $container 2>$null
+                                \$status = & \$docker inspect --format='{{.State.Health.Status}}' \$container 2>\$null
 
-                                Write-Host "Final health check attempt $i : $status"
+                                Write-Host "Final health check attempt \$i : \$status"
 
-                                if ($status -eq "healthy") {
-                                    Write-Host "Final container is healthy."
+                                if (\$status -eq 'healthy') {
+                                    Write-Host 'Final container is healthy.'
                                     exit 0
                                 }
 
-                                if ($status -eq "unhealthy") {
-                                    Write-Host "Final container is unhealthy."
+                                if (\$status -eq 'unhealthy') {
+                                    Write-Host 'Final container is unhealthy.'
                                     exit 1
                                 }
 
                                 Start-Sleep -Seconds 5
                             }
 
-                            Write-Host "Final health check timed out."
+                            Write-Host 'Final health check timed out.'
                             exit 1
-                        '''
+                        """
 
                         echo "========================================"
                         echo "DEPLOYMENT SUCCESSFUL"
-                        echo "Version : ${params.VERSION}"
+                        echo "Version : ${version}"
                         echo "Image   : ${image}"
                         echo "========================================"
 
@@ -387,7 +442,7 @@ pipeline {
                             "%DOCKER%" rm -f ${candidateName} >nul 2>&1 || exit /b 0
                         """
 
-                        if (params.ENVIRONMENT == 'PRODUCTION' &&
+                        if (environment == 'PRODUCTION' &&
                             previousImage != 'NONE' &&
                             previousImage != '') {
 
