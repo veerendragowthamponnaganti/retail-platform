@@ -20,6 +20,14 @@ def home():
 
 @app.route("/health")
 def health():
+    # Intentional failure injection for v4.2.2 rollback demonstration.
+    if APP_VERSION == "v4.2.2":
+        return jsonify({
+            "status": "unhealthy",
+            "version": APP_VERSION,
+            "message": "Intentional health-check failure for rollback test"
+        }), 500
+
     return jsonify({
         "status": "healthy",
         "version": APP_VERSION
@@ -88,3 +96,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8081
     )
+```
