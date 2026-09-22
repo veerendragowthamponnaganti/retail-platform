@@ -5,38 +5,44 @@ parameters {
     choice(
         name: 'DEPLOYMENT_ACTION',
         choices: ['DEPLOY', 'ROLLBACK'],
-        description: 'Choose deployment action'
+        description: 'Select whether to deploy a new version or rollback production'
     )
 
     choice(
         name: 'ENVIRONMENT',
         choices: ['UAT', 'PRODUCTION'],
-        description: 'Choose deployment environment'
+        description: 'Select deployment environment'
     )
 
     string(
         name: 'VERSION',
         defaultValue: 'v4.2.1',
-        description: 'Git tag/version to deploy'
+        description: 'Git tag/version to deploy, for example v4.2.1 or v4.2.2'
     )
 
     choice(
         name: 'CONFIRM_PROD',
         choices: ['NO', 'YES'],
-        description: 'Must be YES for production deployment'
+        description: 'Production deployment confirmation'
     )
 }
 
 environment {
     DOCKER = 'C:\\Users\\ASUS\\AppData\\Local\\Programs\\DockerDesktop\\resources\\bin\\docker.exe'
-    IMAGE_REPOSITORY = 'retail-app'
     NETWORK_NAME = 'retail-network'
+    PRODUCTION_CONTAINER = 'retail-app-production'
+    CANDIDATE_PORT = '8083'
+    PRODUCTION_PORT = '8081'
+    CANDIDATE_NAME = "retail-app-candidate-${BUILD_NUMBER}"
+    IMAGE_NAME = 'retail-app'
 }
 
 stages {
 
     stage('Show Parameters') {
         steps {
+            echo "=============================================="
+            echo "Retail Platform Deployment"
             echo "=============================================="
             echo "Deployment Action : ${params.DEPLOYMENT_ACTION}"
             echo "Environment       : ${params.ENVIRONMENT}"
@@ -51,22 +57,20 @@ stages {
         steps {
             script {
 
-                if (params.DEPLOYMENT_ACTION == 'DEPLOY') {
-
-                    if (params.ENVIRONMENT == 'PRODUCTION' &&
-                        params.CONFIRM_PROD != 'YES') {
-
-                        error(
-                            "PRODUCTION deployment blocked. CONFIRM_PROD must be YES."
-                        )
-                    }
-                }
-
                 if (!params.VERSION?.trim()) {
                     error("VERSION cannot be empty.")
                 }
 
-                echo "Parameter validation successful."
+                if (params.ENVIRONMENT == 'PRODUCTION' &&
+                    params.DEPLOYMENT_ACTION == 'DEPLOY' &&
+                    params.CONFIRM_PROD != 'YES') {
+
+                    error(
+                        "Production deployment blocked. CONFIRM_PROD must be YES."
+                    )
+                }
+
+                echo "Parameter validation passed."
             }
         }
     }
@@ -75,22 +79,46 @@ stages {
         steps {
             script {
 
-                echo "Checking requested Git tag: ${params.VERSION}"
+                echo "Fetching latest Git references..."
 
                 bat """
-                    git fetch --all --tags
-                    git rev-parse --verify refs/tags/${params.VERSION}
+                    git fetch --all --tags --prune
                 """
+
+                echo "Checking whether requested version exists..."
+
+                def tagCheck = bat(
+                    script: """
+                        git rev-parse --verify refs/tags/${params.VERSION}
+                    """,
+                    returnStatus: true
+                )
+
+                if (tagCheck != 0) {
+                    error(
+                        "Requested Git tag ${params.VERSION} does not exist."
+                    )
+                }
+
+                echo "Requested Git tag exists."
 
                 bat """
                     git checkout --force tags/${params.VERSION}
                 """
 
-                bat """
-                    git describe --tags --always --dirty
-                """
+                def selectedCommit = bat(
+                    script: """
+                        git rev-parse HEAD
+                    """,
+                    returnStdout: true
+                ).trim()
 
-                echo "Requested Git version successfully checked out."
+                env.SELECTED_COMMIT = selectedCommit
+
+                echo "=============================================="
+                echo "Selected Git Version : ${params.VERSION}"
+                echo "Selected Git Commit  : ${selectedCommit}"
+                echo "=============================================="
             }
         }
     }
@@ -105,64 +133,96 @@ stages {
         steps {
             script {
 
-                env.IMAGE_TAG =
-                    "${params.VERSION}-${env.BUILD_NUMBER}"
+                env.DEPLOY_IMAGE =
+                    "${IMAGE_NAME}:${params.VERSION}-${BUILD_NUMBER}"
 
                 echo "Building Docker image:"
-                echo "${env.IMAGE_REPOSITORY}:${env.IMAGE_TAG}"
+                echo "${env.DEPLOY_IMAGE}"
 
                 bat """
                     "${DOCKER}" build ^
-                    -t ${IMAGE_REPOSITORY}:${IMAGE_TAG} .
+                    -t ${env.DEPLOY_IMAGE} ^
+                    .
                 """
 
                 echo "Docker image created successfully."
+
+                bat """
+                    "${DOCKER}" images ${IMAGE_NAME}
+                """
             }
         }
     }
 
     stage('Create Docker Network') {
         steps {
-            bat """
-                "${DOCKER}" network inspect ${NETWORK_NAME} >nul 2>nul || ^
-                "${DOCKER}" network create ${NETWORK_NAME}
-            """
+            script {
 
-            echo "Docker network verified: ${NETWORK_NAME}"
+                def networkStatus = bat(
+                    script: """
+                        "${DOCKER}" network inspect ${NETWORK_NAME} >nul 2>&1
+                    """,
+                    returnStatus: true
+                )
+
+                if (networkStatus != 0) {
+
+                    echo "Docker network does not exist."
+                    echo "Creating ${NETWORK_NAME}..."
+
+                    bat """
+                        "${DOCKER}" network create ${NETWORK_NAME}
+                    """
+                }
+                else {
+                    echo "Docker network ${NETWORK_NAME} already exists."
+                }
+            }
         }
     }
 
     stage('Record Previous Production') {
         when {
             expression {
-                params.DEPLOYMENT_ACTION == 'DEPLOY'
+                params.ENVIRONMENT == 'PRODUCTION'
             }
         }
 
         steps {
             script {
 
-                bat """
-                    "${DOCKER}" ps ^
-                    --filter "name=retail-app-production" ^
-                    --format "{{.Image}}" > previous-image.txt 2>nul
-                """
+                echo "Checking current production container..."
 
-                def previousImage = ''
+                def productionExists = bat(
+                    script: """
+                        "${DOCKER}" inspect ${PRODUCTION_CONTAINER} >nul 2>&1
+                    """,
+                    returnStatus: true
+                )
 
-                if (fileExists('previous-image.txt')) {
-                    previousImage = readFile(
-                        'previous-image.txt'
+                if (productionExists == 0) {
+
+                    def previousImage = bat(
+                        script: """
+                            "${DOCKER}" inspect --format="{{.Config.Image}}" ${PRODUCTION_CONTAINER}
+                        """,
+                        returnStdout: true
                     ).trim()
+
+                    env.PREVIOUS_PRODUCTION_IMAGE =
+                        previousImage
+
+                    echo "=============================================="
+                    echo "Previous Production Image:"
+                    echo "${previousImage}"
+                    echo "=============================================="
                 }
+                else {
 
-                if (!previousImage) {
-                    previousImage = 'NONE'
+                    env.PREVIOUS_PRODUCTION_IMAGE = 'NONE'
+
+                    echo "No existing production container found."
                 }
-
-                env.PREVIOUS_PRODUCTION_IMAGE = previousImage
-
-                echo "Previous production image: ${previousImage}"
             }
         }
     }
@@ -177,36 +237,56 @@ stages {
         steps {
             script {
 
-                def rollbackImage = "retail-app:v4.2.1-10"
+                echo "=============================================="
+                echo "MANUAL ROLLBACK REQUESTED"
+                echo "=============================================="
 
-                echo "=============================================="
-                echo "MANUAL ROLLBACK"
-                echo "Restoring image: ${rollbackImage}"
-                echo "=============================================="
+                def rollbackImage = "${IMAGE_NAME}:v4.2.1-10"
+
+                echo "Rollback image:"
+                echo "${rollbackImage}"
+
+                def imageExists = bat(
+                    script: """
+                        "${DOCKER}" image inspect ${rollbackImage} >nul 2>&1
+                    """,
+                    returnStatus: true
+                )
+
+                if (imageExists != 0) {
+                    error(
+                        "Rollback image ${rollbackImage} was not found."
+                    )
+                }
 
                 bat """
-                    "${DOCKER}" rm -f retail-app-production 2>nul || exit /b 0
+                    "${DOCKER}" rm -f ${PRODUCTION_CONTAINER} 2>nul || exit /b 0
                 """
 
                 bat """
                     "${DOCKER}" run -d ^
-                    --name retail-app-production ^
+                    --name ${PRODUCTION_CONTAINER} ^
                     --network ${NETWORK_NAME} ^
-                    -p 8081:8081 ^
+                    -p ${PRODUCTION_PORT}:8081 ^
                     -e APP_VERSION=v4.2.1 ^
                     -e APP_ENV=production ^
                     -e PAYMENT_MODE=normal ^
+                    --cpus=1.0 ^
+                    --memory=512m ^
                     --restart unless-stopped ^
                     ${rollbackImage}
                 """
 
-                echo "Waiting for rollback container health..."
+                echo "Rollback container started."
 
-                sleep(time: 20, unit: 'SECONDS')
+                sleep(
+                    time: 20,
+                    unit: 'SECONDS'
+                )
 
                 def rollbackStatus = powershell(
                     script: """
-                        \$status = & '${DOCKER}' inspect --format='{{.State.Health.Status}}' retail-app-production
+                        \$status = & '${DOCKER}' inspect --format='{{.State.Health.Status}}' ${PRODUCTION_CONTAINER}
                         Write-Output \$status
                     """,
                     returnStdout: true
@@ -216,7 +296,7 @@ stages {
 
                 if (rollbackStatus != 'healthy') {
                     error(
-                        "Manual rollback health check FAILED."
+                        "Manual rollback health check failed."
                     )
                 }
 
@@ -235,40 +315,31 @@ stages {
         steps {
             script {
 
-                def candidateName =
-                    "retail-app-candidate-${env.BUILD_NUMBER}"
-
-                env.CANDIDATE_NAME = candidateName
-
-                def candidatePort =
-                    params.ENVIRONMENT == 'PRODUCTION'
-                    ? '8083'
-                    : '8082'
-
-                env.CANDIDATE_PORT = candidatePort
-
                 echo "=============================================="
-                echo "Starting deployment candidate"
-                echo "Candidate container : ${candidateName}"
-                echo "Candidate image     : ${IMAGE_REPOSITORY}:${IMAGE_TAG}"
-                echo "Candidate port      : ${candidatePort}"
+                echo "Starting Candidate Deployment"
                 echo "=============================================="
+
+                echo "Candidate container:"
+                echo "${env.CANDIDATE_NAME}"
+
+                echo "Candidate image:"
+                echo "${env.DEPLOY_IMAGE}"
 
                 bat """
-                    "${DOCKER}" rm -f ${candidateName} 2>nul || exit /b 0
+                    "${DOCKER}" rm -f ${env.CANDIDATE_NAME} 2>nul || exit /b 0
                 """
 
                 bat """
                     "${DOCKER}" run -d ^
-                    --name ${candidateName} ^
+                    --name ${env.CANDIDATE_NAME} ^
                     --network ${NETWORK_NAME} ^
-                    -p ${candidatePort}:8081 ^
+                    -p ${CANDIDATE_PORT}:8081 ^
                     -e APP_VERSION=${params.VERSION} ^
-                    -e APP_ENV=${params.ENVIRONMENT} ^
+                    -e APP_ENV=${params.ENVIRONMENT.toLowerCase()} ^
                     -e PAYMENT_MODE=normal ^
                     --cpus=1.0 ^
                     --memory=512m ^
-                    ${IMAGE_REPOSITORY}:${IMAGE_TAG}
+                    ${env.DEPLOY_IMAGE}
                 """
 
                 echo "Candidate container started."
@@ -286,9 +357,16 @@ stages {
         steps {
             script {
 
-                echo "Waiting for candidate health check..."
+                echo "=============================================="
+                echo "Candidate Health Check"
+                echo "=============================================="
 
-                sleep(time: 20, unit: 'SECONDS')
+                echo "Waiting for candidate health status..."
+
+                sleep(
+                    time: 20,
+                    unit: 'SECONDS'
+                )
 
                 def candidateStatus = powershell(
                     script: """
@@ -303,18 +381,105 @@ stages {
                 if (candidateStatus != 'healthy') {
 
                     echo "=============================================="
-                    echo "Candidate health check FAILED"
-                    echo "Automatic rollback will start."
+                    echo "CANDIDATE HEALTH CHECK FAILED"
                     echo "=============================================="
+
+                    echo "Automatic rollback will start immediately."
 
                     currentBuild.result = 'FAILURE'
 
+                    def previousImage =
+                        env.PREVIOUS_PRODUCTION_IMAGE
+
+                    if (!previousImage ||
+                        previousImage == 'NONE') {
+
+                        error(
+                            "Candidate failed and previous production image is unavailable."
+                        )
+                    }
+
+                    echo "Previous production image:"
+                    echo "${previousImage}"
+
+                    echo "Stopping failed candidate..."
+
+                    bat """
+                        "${DOCKER}" rm -f ${env.CANDIDATE_NAME} 2>nul || exit /b 0
+                    """
+
+                    echo "Failed candidate removed."
+
+                    echo "Removing current production container..."
+
+                    bat """
+                        "${DOCKER}" rm -f ${PRODUCTION_CONTAINER} 2>nul || exit /b 0
+                    """
+
+                    echo "Restoring previous production image..."
+
+                    bat """
+                        "${DOCKER}" run -d ^
+                        --name ${PRODUCTION_CONTAINER} ^
+                        --network ${NETWORK_NAME} ^
+                        -p ${PRODUCTION_PORT}:8081 ^
+                        -e APP_VERSION=v4.2.1 ^
+                        -e APP_ENV=production ^
+                        -e PAYMENT_MODE=normal ^
+                        --cpus=1.0 ^
+                        --memory=512m ^
+                        --restart unless-stopped ^
+                        ${previousImage}
+                    """
+
+                    echo "Previous production version restored."
+
+                    echo "Waiting for rollback health check..."
+
+                    sleep(
+                        time: 20,
+                        unit: 'SECONDS'
+                    )
+
+                    def rollbackStatus = powershell(
+                        script: """
+                            \$status = & '${DOCKER}' inspect --format='{{.State.Health.Status}}' ${PRODUCTION_CONTAINER}
+                            Write-Output \$status
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    echo "Rollback health status: ${rollbackStatus}"
+
+                    if (rollbackStatus != 'healthy') {
+
+                        echo "=============================================="
+                        echo "ROLLBACK HEALTH CHECK FAILED"
+                        echo "=============================================="
+
+                        error(
+                            "Deployment failed and rollback health check failed."
+                        )
+                    }
+
+                    echo "=============================================="
+                    echo "ROLLBACK VERIFIED SUCCESSFULLY"
+                    echo "=============================================="
+
+                    echo "Production restored to:"
+                    echo "${previousImage}"
+
+                    echo "Production health:"
+                    echo "${rollbackStatus}"
+
                     error(
-                        "Candidate health check failed. Automatic rollback required."
+                        "Deployment failed as expected. Automatic rollback completed successfully."
                     )
                 }
 
-                echo "Candidate health check PASSED."
+                echo "=============================================="
+                echo "CANDIDATE HEALTH CHECK PASSED"
+                echo "=============================================="
             }
         }
     }
@@ -329,43 +494,72 @@ stages {
         steps {
             script {
 
-                def finalName =
-                    params.ENVIRONMENT == 'PRODUCTION'
-                    ? 'retail-app-production'
-                    : 'retail-app-uat'
+                echo "=============================================="
+                echo "Promoting Candidate to Production"
+                echo "=============================================="
 
-                env.FINAL_CONTAINER_NAME = finalName
+                if (params.ENVIRONMENT == 'PRODUCTION') {
 
-                def finalPort =
-                    params.ENVIRONMENT == 'PRODUCTION'
-                    ? '8081'
-                    : '8082'
+                    echo "Production deployment confirmed."
 
-                echo "Promoting candidate to final container:"
-                echo "${finalName}"
+                    echo "Stopping existing production container..."
 
-                bat """
-                    "${DOCKER}" rm -f ${finalName} 2>nul || exit /b 0
-                """
+                    bat """
+                        "${DOCKER}" rm -f ${PRODUCTION_CONTAINER} 2>nul || exit /b 0
+                    """
 
-                bat """
-                    "${DOCKER}" run -d ^
-                    --name ${finalName} ^
-                    --network ${NETWORK_NAME} ^
-                    -p ${finalPort}:8081 ^
-                    -e APP_VERSION=${params.VERSION} ^
-                    -e APP_ENV=${params.ENVIRONMENT} ^
-                    -e PAYMENT_MODE=normal ^
-                    --cpus=1.0 ^
-                    --memory=512m ^
-                    ${IMAGE_REPOSITORY}:${IMAGE_TAG}
-                """
+                    echo "Starting production using new image..."
 
-                bat """
-                    "${DOCKER}" rm -f ${env.CANDIDATE_NAME} 2>nul || exit /b 0
-                """
+                    bat """
+                        "${DOCKER}" run -d ^
+                        --name ${PRODUCTION_CONTAINER} ^
+                        --network ${NETWORK_NAME} ^
+                        -p ${PRODUCTION_PORT}:8081 ^
+                        -e APP_VERSION=${params.VERSION} ^
+                        -e APP_ENV=production ^
+                        -e PAYMENT_MODE=normal ^
+                        --cpus=1.0 ^
+                        --memory=512m ^
+                        --restart unless-stopped ^
+                        ${env.DEPLOY_IMAGE}
+                    """
 
-                echo "New version started."
+                    echo "New production version started."
+
+                    bat """
+                        "${DOCKER}" rm -f ${env.CANDIDATE_NAME} 2>nul || exit /b 0
+                    """
+
+                    echo "Candidate container removed after promotion."
+                }
+                else {
+
+                    echo "UAT deployment selected."
+
+                    bat """
+                        "${DOCKER}" rm -f retail-app-uat 2>nul || exit /b 0
+                    """
+
+                    bat """
+                        "${DOCKER}" run -d ^
+                        --name retail-app-uat ^
+                        --network ${NETWORK_NAME} ^
+                        -p 8081:8081 ^
+                        -e APP_VERSION=${params.VERSION} ^
+                        -e APP_ENV=uat ^
+                        -e PAYMENT_MODE=normal ^
+                        --cpus=1.0 ^
+                        --memory=512m ^
+                        --restart unless-stopped ^
+                        ${env.DEPLOY_IMAGE}
+                    """
+
+                    bat """
+                        "${DOCKER}" rm -f ${env.CANDIDATE_NAME} 2>nul || exit /b 0
+                    """
+
+                    echo "UAT deployment completed."
+                }
             }
         }
     }
@@ -380,35 +574,138 @@ stages {
         steps {
             script {
 
-                echo "Waiting for final container health..."
+                echo "=============================================="
+                echo "Final Deployment Health Check"
+                echo "=============================================="
 
-                sleep(time: 20, unit: 'SECONDS')
+                sleep(
+                    time: 20,
+                    unit: 'SECONDS'
+                )
+
+                def finalContainer =
+                    params.ENVIRONMENT == 'PRODUCTION'
+                    ? PRODUCTION_CONTAINER
+                    : 'retail-app-uat'
 
                 def finalStatus = powershell(
                     script: """
-                        \$status = & '${DOCKER}' inspect --format='{{.State.Health.Status}}' ${env.FINAL_CONTAINER_NAME}
+                        \$status = & '${DOCKER}' inspect --format='{{.State.Health.Status}}' ${finalContainer}
                         Write-Output \$status
                     """,
                     returnStdout: true
                 ).trim()
 
-                echo "Final container health status: ${finalStatus}"
+                echo "Final container:"
+                echo "${finalContainer}"
+
+                echo "Final health status:"
+                echo "${finalStatus}"
 
                 if (finalStatus != 'healthy') {
 
-                    echo "=============================================="
-                    echo "FINAL HEALTH CHECK FAILED"
-                    echo "Starting automatic rollback."
-                    echo "=============================================="
+                    echo "FINAL HEALTH CHECK FAILED."
 
-                    currentBuild.result = 'FAILURE'
+                    if (params.ENVIRONMENT == 'PRODUCTION' &&
+                        env.PREVIOUS_PRODUCTION_IMAGE &&
+                        env.PREVIOUS_PRODUCTION_IMAGE != 'NONE') {
+
+                        echo "Emergency rollback starting..."
+
+                        bat """
+                            "${DOCKER}" rm -f ${PRODUCTION_CONTAINER} 2>nul || exit /b 0
+                        """
+
+                        bat """
+                            "${DOCKER}" run -d ^
+                            --name ${PRODUCTION_CONTAINER} ^
+                            --network ${NETWORK_NAME} ^
+                            -p ${PRODUCTION_PORT}:8081 ^
+                            -e APP_VERSION=v4.2.1 ^
+                            -e APP_ENV=production ^
+                            -e PAYMENT_MODE=normal ^
+                            --cpus=1.0 ^
+                            --memory=512m ^
+                            --restart unless-stopped ^
+                            ${env.PREVIOUS_PRODUCTION_IMAGE}
+                        """
+
+                        sleep(
+                            time: 20,
+                            unit: 'SECONDS'
+                        )
+
+                        def emergencyRollbackStatus = powershell(
+                            script: """
+                                \$status = & '${DOCKER}' inspect --format='{{.State.Health.Status}}' ${PRODUCTION_CONTAINER}
+                                Write-Output \$status
+                            """,
+                            returnStdout: true
+                        ).trim()
+
+                        echo "Emergency rollback health:"
+                        echo "${emergencyRollbackStatus}"
+
+                        if (emergencyRollbackStatus != 'healthy') {
+                            error(
+                                "Final health failed and emergency rollback failed."
+                            )
+                        }
+
+                        error(
+                            "Final health check failed. Emergency rollback completed successfully."
+                        )
+                    }
 
                     error(
-                        "Final health check failed. Automatic rollback required."
+                        "Final health check failed."
                     )
                 }
 
-                echo "Final health check PASSED."
+                echo "=============================================="
+                echo "FINAL HEALTH CHECK PASSED"
+                echo "=============================================="
+            }
+        }
+    }
+
+    stage('Final Validation') {
+        when {
+            expression {
+                params.DEPLOYMENT_ACTION == 'DEPLOY'
+            }
+        }
+
+        steps {
+            script {
+
+                echo "=============================================="
+                echo "Final Deployment Validation"
+                echo "=============================================="
+
+                def validationContainer =
+                    params.ENVIRONMENT == 'PRODUCTION'
+                    ? PRODUCTION_CONTAINER
+                    : 'retail-app-uat'
+
+                bat """
+                    "${DOCKER}" ps
+                """
+
+                bat """
+                    "${DOCKER}" inspect ${validationContainer}
+                """
+
+                echo "Deployment validation completed."
+
+                echo "Selected Git commit:"
+                echo "${env.SELECTED_COMMIT}"
+
+                echo "Requested version:"
+                echo "${params.VERSION}"
+
+                echo "Docker image:"
+                echo "${env.DEPLOY_IMAGE}"
             }
         }
     }
@@ -416,111 +713,12 @@ stages {
     stage('Automatic Rollback') {
         when {
             expression {
-                params.DEPLOYMENT_ACTION == 'DEPLOY' &&
-                currentBuild.result == 'FAILURE'
+                false
             }
         }
 
         steps {
-            script {
-
-                echo "=============================================="
-                echo "AUTOMATIC ROLLBACK STARTED"
-                echo "=============================================="
-
-                def previousImage =
-                    env.PREVIOUS_PRODUCTION_IMAGE
-
-                if (!previousImage ||
-                    previousImage == 'NONE') {
-
-                    echo "No previous production image was recorded."
-
-                    error(
-                        "Automatic rollback cannot continue because previous production image is unavailable."
-                    )
-                }
-
-                echo "Previous production image:"
-                echo "${previousImage}"
-
-                bat """
-                    "${DOCKER}" rm -f ${env.FINAL_CONTAINER_NAME} 2>nul || exit /b 0
-                """
-
-                bat """
-                    "${DOCKER}" run -d ^
-                    --name ${env.FINAL_CONTAINER_NAME} ^
-                    --network ${NETWORK_NAME} ^
-                    -p 8081:8081 ^
-                    -e APP_VERSION=v4.2.1 ^
-                    -e APP_ENV=production ^
-                    -e PAYMENT_MODE=normal ^
-                    --restart unless-stopped ^
-                    ${previousImage}
-                """
-
-                echo "Previous production version restored."
-
-                sleep(time: 20, unit: 'SECONDS')
-
-                def rollbackStatus = powershell(
-                    script: """
-                        \$status = & '${DOCKER}' inspect --format='{{.State.Health.Status}}' ${env.FINAL_CONTAINER_NAME}
-                        Write-Output \$status
-                    """,
-                    returnStdout: true
-                ).trim()
-
-                echo "Rollback health status: ${rollbackStatus}"
-
-                if (rollbackStatus != 'healthy') {
-
-                    echo "=============================================="
-                    echo "ROLLBACK HEALTH CHECK FAILED"
-                    echo "Production recovery could not be verified."
-                    echo "=============================================="
-
-                    error(
-                        "Rollback health check FAILED."
-                    )
-                }
-
-                echo "=============================================="
-                echo "ROLLBACK VERIFIED SUCCESSFULLY"
-                echo "Production restored to:"
-                echo "${previousImage}"
-                echo "=============================================="
-            }
-        }
-    }
-
-    stage('Final Validation') {
-        steps {
-            script {
-
-                echo "=============================================="
-                echo "FINAL DEPLOYMENT VALIDATION"
-                echo "=============================================="
-
-                bat """
-                    "${DOCKER}" ps -a
-                """
-
-                bat """
-                    "${DOCKER}" images ${IMAGE_REPOSITORY}
-                """
-
-                if (params.DEPLOYMENT_ACTION == 'DEPLOY') {
-
-                    echo "Requested version : ${params.VERSION}"
-                    echo "Build number      : ${env.BUILD_NUMBER}"
-                    echo "Image tag         : ${env.IMAGE_TAG}"
-                    echo "Previous image    : ${env.PREVIOUS_PRODUCTION_IMAGE}"
-                }
-
-                echo "=============================================="
-            }
+            echo "Automatic rollback is handled inside Candidate Health Check."
         }
     }
 }
@@ -530,31 +728,67 @@ post {
     always {
 
         echo "=============================================="
-        echo "FINAL DOCKER STATE"
+        echo "POST DEPLOYMENT INFORMATION"
+        echo "=============================================="
+
+        echo "Build Number:"
+        echo "${env.BUILD_NUMBER}"
+
+        echo "Requested Version:"
+        echo "${params.VERSION}"
+
+        echo "Deployment Action:"
+        echo "${params.DEPLOYMENT_ACTION}"
+
+        echo "Environment:"
+        echo "${params.ENVIRONMENT}"
+
+        echo "Selected Commit:"
+        echo "${env.SELECTED_COMMIT}"
+
+        echo "Previous Production Image:"
+        echo "${env.PREVIOUS_PRODUCTION_IMAGE}"
+
         echo "=============================================="
 
         bat """
             "${DOCKER}" ps -a
         """
 
-        echo "=============================================="
+        echo "Docker images currently available:"
+
+        bat """
+            "${DOCKER}" images ${IMAGE_NAME}
+        """
     }
 
     success {
 
         echo "=============================================="
         echo "JENKINS BUILD SUCCESSFUL"
-        echo "Deployment completed successfully."
         echo "=============================================="
+
+        echo "Deployment completed successfully."
+
+        echo "Version:"
+        echo "${params.VERSION}"
+
+        echo "Commit:"
+        echo "${env.SELECTED_COMMIT}"
     }
 
     failure {
 
         echo "=============================================="
         echo "JENKINS BUILD FAILED"
-        echo "If deployment failed, rollback protection was triggered."
-        echo "Check the console output for rollback verification."
+        echo "=============================================="
+
+        echo "Candidate health failure triggers immediate automatic rollback."
+
+        echo "Production state can be verified from Docker output above."
+
         echo "=============================================="
     }
 }
+
 }
