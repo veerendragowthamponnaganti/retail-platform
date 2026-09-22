@@ -1,3 +1,4 @@
+```groovy
 pipeline {
     agent any
 
@@ -240,7 +241,19 @@ pipeline {
             steps {
                 script {
 
-                    def hostPort =
+                    /*
+                     * Production candidate uses 8083 so that
+                     * production v4.2.1 can remain running on 8081
+                     * while the new version is validated.
+                     *
+                     * UAT candidate uses 8082.
+                     */
+                    def candidatePort =
+                        params.ENVIRONMENT == 'PRODUCTION'
+                            ? '8083'
+                            : '8082'
+
+                    def finalPort =
                         params.ENVIRONMENT == 'PRODUCTION'
                             ? '8081'
                             : '8082'
@@ -255,22 +268,30 @@ pipeline {
 
                     env.CANDIDATE_NAME = candidateName
                     env.FINAL_NAME = finalName
-                    env.DEPLOY_PORT = hostPort
+                    env.CANDIDATE_PORT = candidatePort
+                    env.DEPLOY_PORT = finalPort
 
                     echo "=========================================="
                     echo "DEPLOYMENT START"
-                    echo "Environment : ${params.ENVIRONMENT}"
-                    echo "Version     : ${params.VERSION}"
-                    echo "Image       : ${env.BUILD_IMAGE}"
-                    echo "Candidate   : ${candidateName}"
-                    echo "Final       : ${finalName}"
-                    echo "Port        : ${hostPort}"
+                    echo "Environment    : ${params.ENVIRONMENT}"
+                    echo "Version        : ${params.VERSION}"
+                    echo "Image          : ${env.BUILD_IMAGE}"
+                    echo "Candidate      : ${candidateName}"
+                    echo "Candidate Port : ${candidatePort}"
+                    echo "Final          : ${finalName}"
+                    echo "Final Port     : ${finalPort}"
                     echo "=========================================="
 
                     try {
 
                         /*
                          * Start new version first.
+                         *
+                         * PRODUCTION:
+                         * candidate -> host 8083 -> container 8081
+                         *
+                         * UAT:
+                         * candidate -> host 8082 -> container 8081
                          */
                         bat """
                             @echo off
@@ -280,7 +301,7 @@ pipeline {
                             "%DOCKER%" run -d ^
                                 --name "${candidateName}" ^
                                 --network "${env.NETWORK_NAME}" ^
-                                -p ${hostPort}:8081 ^
+                                -p ${candidatePort}:8081 ^
                                 -e APP_VERSION=${params.VERSION} ^
                                 -e APP_ENV=${params.ENVIRONMENT.toLowerCase()} ^
                                 -e PAYMENT_MODE=normal ^
@@ -341,7 +362,7 @@ pipeline {
                         /*
                          * UAT:
                          * Remove candidate before final container
-                         * because both cannot use port 8082.
+                         * because both use port 8082.
                          */
                         if (params.ENVIRONMENT == 'UAT') {
 
@@ -361,7 +382,7 @@ pipeline {
                                 "%DOCKER%" run -d ^
                                     --name "${finalName}" ^
                                     --network "${env.NETWORK_NAME}" ^
-                                    -p ${hostPort}:8081 ^
+                                    -p ${finalPort}:8081 ^
                                     -e APP_VERSION=${params.VERSION} ^
                                     -e APP_ENV=uat ^
                                     -e PAYMENT_MODE=normal ^
@@ -377,10 +398,15 @@ pipeline {
 
                             /*
                              * PRODUCTION:
-                             * Keep old production running until
-                             * candidate health check passes.
+                             *
+                             * Old production remains on 8081
+                             * while candidate is validated on 8083.
+                             *
+                             * Only after candidate becomes healthy
+                             * do we remove old production.
                              */
                             echo "Production candidate is healthy."
+                            echo "Candidate was validated on port 8083."
                             echo "Removing old production container..."
 
                             bat """
@@ -391,7 +417,7 @@ pipeline {
 
                             /*
                              * Candidate has already been validated.
-                             * Recreate it as the production container.
+                             * Recreate production on port 8081.
                              */
                             bat """
                                 @echo off
@@ -499,19 +525,57 @@ pipeline {
 
                                 echo "Rollback container started."
 
-                                sleep 5
+                                /*
+                                 * Verify rollback health properly.
+                                 */
+                                script {
 
-                                bat """
-                                    @echo off
+                                    def rollbackHealthy = false
 
-                                    echo ===== ROLLBACK HEALTH =====
+                                    for (int i = 1; i <= 12; i++) {
 
-                                    "%DOCKER%" inspect ^
-                                        --format="{{.State.Health.Status}}" ^
-                                        retail-app-production
-                                """
+                                        sleep 5
 
-                                echo "Automatic rollback verified."
+                                        def rollbackHealth = bat(
+                                            returnStdout: true,
+                                            script: """
+                                                @echo off
+
+                                                "%DOCKER%" inspect ^
+                                                    --format="{{.State.Health.Status}}" ^
+                                                    retail-app-production
+                                            """
+                                        ).trim()
+
+                                        echo "Rollback health check ${i}/12: ${rollbackHealth}"
+
+                                        if (rollbackHealth == 'healthy') {
+                                            rollbackHealthy = true
+                                            break
+                                        }
+
+                                        if (rollbackHealth == 'unhealthy') {
+                                            break
+                                        }
+                                    }
+
+                                    if (!rollbackHealthy) {
+
+                                        echo "=========================================="
+                                        echo "AUTOMATIC ROLLBACK HEALTH CHECK FAILED"
+                                        echo "=========================================="
+
+                                        error(
+                                            "Automatic rollback container did not become healthy."
+                                        )
+                                    }
+
+                                    echo "=========================================="
+                                    echo "AUTOMATIC ROLLBACK VERIFIED"
+                                    echo "Production restored successfully."
+                                    echo "Restored image: ${rollbackImage}"
+                                    echo "=========================================="
+                                }
                             }
 
                             echo "=========================================="
@@ -632,3 +696,4 @@ pipeline {
         }
     }
 }
+```
